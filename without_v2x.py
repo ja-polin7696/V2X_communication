@@ -97,7 +97,7 @@ def on_collision(event):
 collision_sensor.listen(on_collision)
 
 # === Spawn AVs ===
-num_avs = 30
+num_avs = 75
 avs = []
 available_spawn_points = spawn_points[1:]
 random.shuffle(available_spawn_points)
