@@ -1,0 +1,248 @@
+# === RSU V2X METRICS PIPELINE - WITHOUT V2X ===
+
+import carla
+import time
+import math
+import random
+import pygame
+import sys
+import numpy as np
+import os
+import csv
+from datetime import datetime
+
+# === MODE FLAGS ===
+V2X_ENABLED = False    # <==== DISABLED
+AUTOPILOT_MODE = True
+RUN_DURATION_SEC = 1800
+METRICS_FOLDER = r"C:\Users\vclab\Downloads\CARLA_0.9.15\WindowsNoEditor\PythonAPI\examples\rq_1\metrics"
+
+# === METRICS ===
+metrics = {
+    "collisions": 0,
+    "near_misses": 0,
+    "v2x_alerts_sent": 0,
+    "v2x_alerts_received": 0,
+    "v2x_alert_latency_ms": [],
+    "response_times_sec": [],
+    "speed_reduction_ratios": [],
+    "max_deceleration_mps2": [],
+    "hmi_ack_count": 0,
+    "v2x_alert_times": [],
+}
+
+# === BLOCK 4: Metrics Save to CSV ===
+def save_metrics_to_csv():
+    filename = f"metrics_run_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    with open(filename, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["Metric", "Value"])
+        writer.writerow(["V2X Enabled", V2X_ENABLED])
+        writer.writerow(["Autopilot Mode", AUTOPILOT_MODE])
+        writer.writerow(["Collisions", metrics["collisions"]])
+        writer.writerow(["Near Misses", metrics["near_misses"]])
+        writer.writerow(["V2X Alerts Sent", metrics["v2x_alerts_sent"]])
+        writer.writerow(["V2X Alerts Received", metrics["v2x_alerts_received"]])
+        writer.writerow(["Avg V2X Latency (ms)", np.mean(metrics["v2x_alert_latency_ms"]) if metrics["v2x_alert_latency_ms"] else "N/A"])
+        writer.writerow(["Avg Response Time (sec)", np.mean(metrics["response_times_sec"]) if metrics["response_times_sec"] else "N/A"])
+        writer.writerow(["Median Response Time (sec)", np.median(metrics["response_times_sec"]) if metrics["response_times_sec"] else "N/A"])
+        writer.writerow(["Avg Speed Reduction Ratio", np.mean(metrics["speed_reduction_ratios"]) if metrics["speed_reduction_ratios"] else "N/A"])
+        writer.writerow(["Max Deceleration (m/s²)", min(metrics["max_deceleration_mps2"]) if metrics["max_deceleration_mps2"] else "N/A"])
+        writer.writerow(["HMI Ack Count", metrics["hmi_ack_count"]])
+
+    print(f"[METRICS] Saved metrics to {filename}")
+
+# === Initialize Pygame and CARLA ===
+pygame.init()
+display = pygame.display.set_mode((800, 600))
+pygame.display.set_caption("CARLA - RSU V2X Metrics Pipeline (NO V2X)")
+
+client = carla.Client("localhost", 2000)
+client.set_timeout(10.0)
+world = client.load_world("Town03")
+bp_lib = world.get_blueprint_library()
+
+# === Setup Traffic Manager ===
+traffic_manager = client.get_trafficmanager(8000)
+traffic_manager.set_synchronous_mode(False)
+
+# === Safe Ego Spawn ===
+ego_bp = bp_lib.find('vehicle.tesla.model3')
+spawn_points = world.get_map().get_spawn_points()
+random.shuffle(spawn_points)
+
+ego_vehicle = None
+for spawn_point in spawn_points:
+    ego_vehicle = world.try_spawn_actor(ego_bp, spawn_point)
+    if ego_vehicle is not None:
+        break
+
+if ego_vehicle is None:
+    print("[ERROR] Failed to spawn EGO vehicle after trying all spawn points! Exiting.")
+    sys.exit(1)
+
+ego_vehicle.set_autopilot(AUTOPILOT_MODE)
+
+print(f"[EGO] Spawned at {ego_vehicle.get_location()}")
+print(f"[MODE] Autopilot {'ENABLED' if AUTOPILOT_MODE else 'DISABLED'}")
+
+# === Collision Sensor ===
+collision_bp = bp_lib.find('sensor.other.collision')
+collision_sensor = world.spawn_actor(collision_bp, carla.Transform(), attach_to=ego_vehicle)
+
+def on_collision(event):
+    metrics["collisions"] += 1
+    print(f"[COLLISION] with {event.other_actor.type_id}")
+
+collision_sensor.listen(on_collision)
+
+# === Spawn AVs ===
+num_avs = 30
+avs = []
+available_spawn_points = spawn_points[1:]
+random.shuffle(available_spawn_points)
+vehicle_bps = bp_lib.filter('vehicle.*')
+
+for i in range(min(num_avs, len(available_spawn_points))):
+    av_bp = random.choice(vehicle_bps)
+    spawn_point = available_spawn_points[i]
+    av = world.try_spawn_actor(av_bp, spawn_point)
+    if av:
+        av.set_autopilot(True)
+        avs.append(av)
+
+print(f"[INFO] Spawned {len(avs)} AVs")
+
+# === Spawn Camera ===
+camera_bp = bp_lib.find('sensor.camera.rgb')
+camera_bp.set_attribute('image_size_x', '800')
+camera_bp.set_attribute('image_size_y', '600')
+camera_bp.set_attribute('fov', '90')
+camera = world.spawn_actor(camera_bp, carla.Transform(carla.Location(x=1.5, z=2.4)), attach_to=ego_vehicle)
+
+frame_surface = None
+def camera_callback(image):
+    global frame_surface
+    array = np.frombuffer(image.raw_data, dtype=np.uint8).reshape(image.height, image.width, 4)
+    frame_surface = pygame.surfarray.make_surface(array[:, :, :3].swapaxes(0, 1))
+
+camera.listen(camera_callback)
+
+# === Spawn Pedestrians ===
+num_peds = 50
+ped_bp = bp_lib.filter('walker.pedestrian.*')
+ped_cont_bp = bp_lib.find('controller.ai.walker')
+pedestrian_actors = []
+
+for _ in range(num_peds):
+    nav_point = world.get_random_location_from_navigation()
+    if nav_point is None:
+        continue
+
+    ped_transform = carla.Transform(nav_point)
+    ped_actor = world.try_spawn_actor(random.choice(ped_bp), ped_transform)
+
+    if ped_actor:
+        ped_controller = world.try_spawn_actor(ped_cont_bp, carla.Transform(), attach_to=ped_actor)
+        if ped_controller:
+            ped_controller.start()
+            target_point = world.get_random_location_from_navigation()
+            if target_point:
+                ped_controller.go_to_location(target_point)
+            pedestrian_actors.append((ped_actor, ped_controller))
+
+print(f"[INFO] Spawned {len(pedestrian_actors)} pedestrians")
+
+# === Main Loop Variables ===
+clock = pygame.time.Clock()
+control = carla.VehicleControl()
+running = True
+start_time = time.time()
+last_speed = 0.0
+v2x_triggered = False
+v2x_trigger_time = 0.0
+v2x_brake_applied = False
+v2x_near_miss_logged = False
+
+# === Main Loop ===
+try:
+    print(f"[INFO] Starting main loop for {RUN_DURATION_SEC} seconds...")
+
+    while running:
+        current_time = time.time()
+
+        # === Always process pygame events ===
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+                running = False
+
+        # === Auto-terminate after RUN_DURATION_SEC ===
+        if current_time - start_time >= RUN_DURATION_SEC:
+            print("\n[INFO] Run duration reached. Stopping...")
+            break
+
+        # === Vehicle Speed ===
+        vel = ego_vehicle.get_velocity()
+        speed = math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2)
+
+        # === Simulated Blind Zone Trigger ===
+        if not v2x_triggered and random.random() < 0.01:
+            max_zone = random.choice(["front", "left", "right", "rear"])
+            blind_zone_area = random.uniform(20, 100)
+            blind_zone_dist = random.uniform(5, 20)
+            blind_zone_cause = random.choice(["Static", "Dynamic Vehicle", "Pedestrian"])
+
+            print(f"[SIMULATION] Blind Zone Triggered → {max_zone.upper()} | Area={blind_zone_area:.1f} | Dist={blind_zone_dist:.1f} m | Cause={blind_zone_cause}")
+
+            v2x_triggered = True
+            v2x_trigger_time = time.time()
+            v2x_brake_applied = False
+            v2x_near_miss_logged = False
+
+        # === Autopilot Reaction to V2X ===
+        if AUTOPILOT_MODE and v2x_triggered and V2X_ENABLED:
+            # V2X reaction would occur here, but V2X is disabled.
+            pass
+
+        # === Display Camera Frame ===
+        if frame_surface:
+            display.blit(frame_surface, (0, 0))
+        pygame.display.flip()
+
+        # === Update Speed for next loop ===
+        last_speed = speed
+
+        clock.tick(20)
+
+finally:
+    print("[DEBUG] Current working directory:", os.getcwd())
+
+    try:
+        save_metrics_to_csv()
+        print("[DEBUG] CSV generation successful!")
+    except Exception as e:
+        print(f"[ERROR] CSV generation failed due to: {e}")
+
+    # === Cleanup Actors ===
+    if camera.is_alive:
+        camera.stop()
+        camera.destroy()
+
+    if collision_sensor.is_alive:
+        collision_sensor.stop()
+        collision_sensor.destroy()
+
+    ego_vehicle.destroy()
+
+    for av in avs:
+        if av.is_alive:
+            av.destroy()
+
+    for ped, controller in pedestrian_actors:
+        controller.stop()
+        controller.destroy()
+        ped.destroy()
+
+    pygame.quit()
+
+    print("[DONE] All actors cleaned up. Program complete.")
